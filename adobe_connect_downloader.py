@@ -339,6 +339,11 @@ async def capture(args):
     finally:
         await st.finish_assets()
         st.close()
+    if getattr(args, "close_chrome", False):
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.terminate()
     ok = [f"ws{c['n']}" for c in st.conns.values() if c["ok"]]
     print(f"\nCapture saved: {out}")
     print(f"WebSocket count : {len(st.conns)} observed")
@@ -439,6 +444,12 @@ async def run_capture(websockets, ver, st, args):
                     print("[DURATION] Player clock not found on any page/frame.", flush=True)
             if not room_url:
                 print("[CAPTURE] No class URL detected; captured traffic will still be analyzed.", flush=True)
+            if getattr(args, "close_chrome", False):
+                await st.finish_assets()
+                try:
+                    await asyncio.wait_for(cdp.send("Browser.close"), 5)
+                except Exception:
+                    pass
             rd.cancel()
             await asyncio.gather(rd, return_exceptions=True)
         else:
@@ -605,6 +616,7 @@ def run_report(fn, args, filename):
         raise err
 
 # Stream download and rendering
+
 class UI:
     live = False
 
@@ -1006,6 +1018,7 @@ async def open_session(ctx, label):
     last = "unknown"
     # Keep handshake retries bounded; worker-level retries already retry the segment.
     n = max(1, min(ctx["retries"], 3))
+    t_open = time.time()
     for attempt in range(1, n + 1):
         seen = []
         ws = None
@@ -1026,6 +1039,7 @@ async def open_session(ctx, label):
                     break
                 seen.append(summarize(m))
                 if isinstance(m, str) and "NetConnection.Connect.Success" in m:
+                    print(f"[CONNECT] {label}: connected on attempt {attempt}/{n} after {time.time() - t_open:.1f}s", flush=True)
                     return ws
                 if isinstance(m, str) and "NetConnection.Connect" in m:
                     last = f"connect refused: {m[:200]}"
@@ -2293,6 +2307,25 @@ async def cmd_get(a):
         convert(out, res, a.fps)
 
 
+VIDEO_NAME_RX = re.compile(r"screen|camera|video|webcam", re.I)
+
+
+def pick_video_streams(starts, media_by_name):
+    """Every video-looking stream listed in the session (has a startTime), whether or not the browser
+    received any of its frames during the capture. Streams with another name are added only if
+    non-audio frames were actually seen. Returns [(startTime_ms, name)] sorted by start."""
+    out = {}
+    for n, t in starts.items():
+        if "cameraVoip" in n or FT_RX.match(n):
+            continue
+        if VIDEO_NAME_RX.search(n):
+            out[n] = t
+    for n, kinds in media_by_name.items():
+        if n in starts and n not in out and any(k != 3 and nf > 0 for k, (nf, *_r) in kinds.items()):
+            out[n] = starts[n]
+    return sorted((t, n) for n, t in out.items())
+
+
 async def cmd_all(a):
     ctx = build_ctx(a)
     names, starts = collect_streams(ctx["frames"])
@@ -2305,16 +2338,12 @@ async def cmd_all(a):
             media_by_name[name] = kinds
 
     cams = sorted(((t, n) for n, t in starts.items() if "cameraVoip" in n), key=lambda x: x[0])
-    video_candidates = []
-    for n, kinds in media_by_name.items():
-        if n in starts and any(k != 3 and nf > 0 for k, (nf, *_r) in kinds.items()):
-            video_candidates.append((starts[n], n))
-    video_candidates.sort(key=lambda x: x[0])
+    video_candidates = pick_video_streams(starts, media_by_name)
 
     if not cams:
         sys.exit("no cameraVoip streams with a startTime in the capture")
     if not video_candidates:
-        print("[INFO] No separate video stream was found in the browser capture. "
+        print("[INFO] No screen-share/video stream is listed in the session. "
               "The final video will use audio plus any captured Whiteboard/PDF content.")
 
     outdir = Path(a.outdir)
@@ -2649,6 +2678,8 @@ def _pipeline_main(argv=None):
     parser.add_argument("--no-files", action="store_true", help="skip document downloads")
     parser.add_argument("--no-whiteboard", action="store_true", help="skip Whiteboard rendering")
     parser.add_argument("--no-extras", action="store_true", help="skip auxiliary event streams")
+    parser.add_argument("--connect-timeout", type=float, default=20.0, help="seconds to wait for each Connect response")
+    parser.add_argument("--close-chrome", action="store_true", help="close Chrome when capture ends (frees the browser's own session before downloading)")
     parser.add_argument("--delete-capture", action="store_true", help="delete the capture folder (cookies/session tickets) after a successful run")
     parser.add_argument("--tools", action="store_true", help="run the advanced subcommand interface instead")
     args, remainder = parser.parse_known_args(argv)
@@ -2679,7 +2710,7 @@ def _pipeline_main(argv=None):
     print("Chrome will open. Follow the capture prompt, then press Enter after pausing the recording.")
     capture_args = argparse.Namespace(url=[args.url], match=None, out=str(cap), profile=args.profile,
                                       chrome=args.chrome, port=args.port, stop_on_enter=True,
-                                      length=args.length)
+                                      length=args.length, close_chrome=args.close_chrome)
     try:
         asyncio.run(capture(capture_args))
     except KeyboardInterrupt:
@@ -2707,7 +2738,7 @@ def _pipeline_main(argv=None):
     print()
     print("STEP 2/2 — Download and render")
     all_args = argparse.Namespace(
-        cap=str(cap), ws="auto", map="3=8,4=9", idle=30.0, connect_timeout=20.0, cookie=None,
+        cap=str(cap), ws="auto", map="3=8,4=9", idle=30.0, connect_timeout=args.connect_timeout, cookie=None,
         preload=False, jobs=args.jobs, retries=args.retries, conns=args.conns, seg=args.seg, overlap=args.overlap,
         reuse=True, fresh=False, no_frag=False, fps=args.fps, outdir=str(work), out=str(out),
         length=length, vsplit=False, no_files=args.no_files, no_extras=args.no_extras,
@@ -2820,4 +2851,4 @@ def _advanced_main(argv=None):
 if __name__ == "__main__":
     raise SystemExit(_pipeline_main())
 
-#MadMad_2823
+#MadMad_2854
