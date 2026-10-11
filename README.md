@@ -1,0 +1,180 @@
+# Adobe Connect Downloader
+<div dir="rtl">
+
+یه اسکریپت پایتون که کلاس ضبط شده Adobe Connect رو دانلود میکنه و یه MP4 کامل ازش میسازه (صدا + PDF + وایت‌بورد + اشتراک صفحه).
+
+---
+
+## چطوری کار میکنه ❓
+1. **ضبط:** Chrome باز میشه، تو لاگین میکنی و یکوچولو از کلاس رو پخش میکنی. اسکریپت ترافیک رو ضبط میکنه.
+2. **دانلود و رندر:** با همون نشست ضبط شده، صدا/تصویر دانلود میشه، PDF و وایت‌بورد از روی رویدادهای ضبط شده ساخته میشن و ffmpeg همه رو یکی میکنه.
+
+---
+
+## نصب
+* Python 3.10 به بالا
+* Chrome
+* ffmpeg (تو PATH باشه)
+
+```bash
+python -m pip install websockets pymupdf pillow
+winget install Gyan.FFmpeg
+```
+
+>بعد از نصب ffmpeg ترمینال رو ببند و دوباره باز کن.
+
+---
+
+## اجرا
+```bash
+python adobe_connect_downloader.py
+```
+
+### مرحله ۱: ضبط
+1. Chrome باز میشه، لاگین کن و کلاس ضبط شده رو باز کن.
+2. چند ثانیه‌ش رو پخش کن. بهتره چند جای کلاس رو هم بری و چند ثانیه پخش کنی (اول، ۲۵٪، ۵۰٪، ۷۵٪، آخر).
+3. ویدیو رو استپ کن
+4. برگرد تو ترمینال **Enter** بزن.
+
+### مدت کلاس
+بعد از Enter، اسکریپت مدت رو از ساعت پلیر میخونه و بعدش ازت میپرسه:
+
+</div>
+
+```
+Full class duration (seconds, M:SS, or H:MM:SS; Enter=use_detected):
+```
+
+<div dir="rtl">
+
+* Enter خالی = همون مقدار تشخیص داده شده
+* یا خودت بنویس: `4763` یا `79:23` یا `1:19:23`
+
+### مرحله ۲: دانلود و رندر
+خودکار انجام میشه و آخرش `class.mp4` ساخته میشه. اگه وسطش قطع شد یا فایل خروجی ناقص بود یا هر بلای اسمونی/غیراسمونی دیگه، همون دستور رو با **همون `--outdir`** دوباره بزن(قطعه‌های کامل دوباره دانلود نمیشن).
+
+> برای کلاس جدید حتما `--outdir` عوض کن یا پوشه قبلی رو پاک کن، وگرنه قطعه‌های کلاس قبلی استفاده میشن.
+
+---
+
+## گزینه‌ های دستی
+|گزینه|پیش‌فرض|کار|
+|-|-|-|
+|`url`|`https://as.kazerunsfu.ac.ir`|آدرس اتاق|
+|`--out`|`class.mp4`|فایل نهایی|
+|`--outdir`|`PATH/class_work`|پوشه کار|
+|`--length`|میپرسه|مدت کلاس (ثانیه)|
+|`--fps`|`10`|فریم‌ریت|
+|`--chrome`|خودکار|مسیر Chrome|
+|`--port`|`9222`|پورت دیباگ|
+|`--profile`|`chrome_profile`|پروفایل Chrome (لاگین رو نگه میداره)|
+|`--capture-dir`|`capture_<زمان>`|پوشه ضبط|
+|`--seg`|`300`|طول هر قطعه صدا (ثانیه)|
+|`--conns`|`0` (خودکار)|تعداد دانلود همزمان (حداکثر ۴)|
+|`--no-files`|غیرفعال|فایل‌های اتاق دانلود نشه|
+|`--no-whiteboard`|غیرفعال|وایت‌بورد رندر نشه|
+|`--no-extras`|غیرفعال|استریم‌های کمکی (چت و...) دانلود نشه|
+|`--delete-capture`|غیرفعال|بعد از موفقیت پوشه ضبط پاک بشه|
+
+> `--jobs` فقط وقتی `--seg 0` باشه اثر داره. `--retries` اتصال هر session رو حداکثر ۳ بار امتحان میکنه.
+
+---
+
+## دستورهای پیشرفته
+</div>
+
+```bash
+python adobe_connect_downloader.py --tools <دستور> ...
+```
+
+|دستور|کار|
+|-|-|
+|`capture [url]`|<div dir="rtl">فقط ضبط</div>|
+|`all <cap>`|<div dir="rtl">مرحله ۲ روی ضبط موجود (بدون ضبط دوباره)</div>|
+|`streams <cap>`|<div dir="rtl">لیست استریم‌ها</div>|
+|`peek <cap> --stream NAME`|<div dir="rtl">چند فریم اول یه استریم</div>|
+|`files <cap>`|<div dir="rtl">فقط دانلود فایل‌های اشتراکی</div>|
+|`get <cap> --stream NAME`|<div dir="rtl">دانلود یه استریم</div>|
+|`analyze <dir>`|<div dir="rtl">گزارش ضبط (میره تو `analysis.txt`)</div>|
+|`inspect <dir> --ws ws3`|<div dir="rtl">بازرسی فریم‌ها (میره تو `inspect.txt`)</div>|
+
+<div dir="rtl">مثلا مرحله ۲ شکست خورد، بدون ضبط دوباره:</div>
+
+```bash
+python adobe_connect_downloader.py --tools all capture_20261011_185050 --length 4819 --outdir class_work --out class.mp4 --reuse
+```
+
+
+---
+
+<div dir="rtl">
+
+## خروجی‌ ها
+**پوشه ضبط (`capture_...`)**: `wsN.recv.bin`، `wsN.sent.bin`، `wsN.idx.jsonl`، `wsN.meta.json`، `wsN.handshake.json` (کوکی)، `http.jsonl`، `rooms.jsonl`، `assets/` (PDFها و ...).
+
+**پوشه کار (`class_work`)**:
+* `parts/` قطعه‌های دانلود شده
+* `*.flv` استریم‌های ادغام شده
+* `files/` فایل‌ها و PDFها
+* `extras/` رویدادهای چت و ... (فعلا فقط ذخیره میشن ولی تو ویدیو نیستن)
+* `pdf_timeline.mp4` و `whiteboard_timeline.mov|mp4`
+
+**نهایی**: `class.mp4`
+ویدیوی نهایی ۱۲۸۰×۷۲۰ هست.
+ترتیب لایه‌ها از پایین: PDF، وایت‌بورد، اشتراک صفحه.
+طولشم برابر مدتیه که انتخاب کردی.
+
+---
+
+## مشکلات احتمالی دیده شده
+</div>
+
+|پیام / مشکل|علت|راه‌حل|
+|-|-|-|
+|`Chrome not found`|<div dir="rtl">Chrome پیدا نشد</div>|<div dir="rtl">`--chrome "مسیر chrome.exe"`</div>|
+|`Chrome debug port did not open`|<div dir="rtl">پورت اشغاله یا Chrome با همین پروفایل بازه</div>|<div dir="rtl">Chrome رو کامل ببند یا `--port` عوض کن</div>|
+|`Connect.Success : none`|<div dir="rtl">نشست برقرار نشد</div>|<div dir="rtl">قبل از Enter کلاس رو کامل باز کن و پخش کن</div>|
+|`no Connect response`|<div dir="rtl">ticket منقضی شده</div>|<div dir="rtl">بعد از ضبط سریع دانلود کن، یا دوباره ضبط کن</div>|
+|`got an HTML page (login/expired cookie?)`|<div dir="rtl">کوکی نامعتبر</div>|<div dir="rtl">دوباره ضبط کن و سریع دانلود کن</div>|
+|`PDF ... rendering needs PyMuPDF and Pillow`|<div dir="rtl">نصب نیستن</div>|<div dir="rtl">`pip install pymupdf pillow`</div>|
+|<div dir="rtl">صفحه سفید به جای PDF</div>|<div dir="rtl">PDF رندر نشده، وایت‌بورد سفید همه‌جا رو گرفته</div>|<div dir="rtl">خط `[PDF] ... rendered into video` و پیام‌های `PDF ...`  بالاش رو بخون احتمالا دوباره ران کنی حل میشه</div>|
+|`no PDF page-change timestamps`|<div dir="rtl">تغییر صفحه تو ضبط نبود</div>|<div dir="rtl">صفحه ۱ ثابت میمونه. موقع ضبط چند جایی که PDF ورق میخوره رو پخش کن</div>|
+|`[DURATION] Player clock not found`|<div dir="rtl">ساعت پلیر موقع Enter تو صفحه نبود</div>|<div dir="rtl">پلیر رو باز نگه دار یا مدت رو دستی بزن</div>|
+|`[INCOMPLETE] ... segment(s)` / `holes`|<div dir="rtl">چندتا قطعه شکست خورد</div>|<div dir="rtl">همون دستور رو با همون `--outdir` دوباره بزن</div>|
+|`ffmpeg not found`|<div dir="rtl">نصب نیست</div>|<div dir="rtl">نصب کن و ترمینال رو ببند و دوباره باز کن</div>|
+|قطعه‌های کلاس قبلی استفاده شد|<div dir="rtl">`--outdir` قدیمی</div>|<div dir="rtl">`--outdir` جدید بده یا قبلی رو حذف کن</div>|
+
+<div dir="rtl">
+
+برای بررسی عمیق: 
+`--tools analyze <پوشه ضبط>` یا `--tools streams <پوشه ضبط>`
+
+---
+
+## امنیت
+* رمزت رو اسکریپت نمیخونه، لاگین فقط تو Chrome انجام میشه.
+* **پوشه ضبط حساسه:** کوکی و ticket نشست توشه. به کسی نده. `chrome_profile` هم لاگینت رو نگه میداره.
+* کوکی فقط به سرور خود adobe connect فرستاده میشه (ریدایرکت به جای دیگه کوکی رو حذف میکنه).
+* پورت دیباگ فقط رو `127.0.0.1` بازه ولی رمز نداره.
+* `--delete-capture` پوشه ضبط رو بعد از موفقیت پاک میکنه (بعدش نمیتونی از همون ضبط دوباره دانلود کنی).
+
+---
+
+## محدودیت‌ ها
+* وایت‌بورد فقط خط‌های مداد (`pencil`) رو میکشه.
+* چت تو ویدیو نیست.
+* اگه چند PDF اشتراک گذاشته شده ولی فقط یه `connect.pdf` دانلود شده، نسبت دادنش به یکی از اونا احتمالا حدسیه. صفحه‌ها رو تو ویدیو چک کن.
+* وایت‌بورد و PDF فقط از ترافیک ضبط شده ساخته میشن، هرچی تو ضبط نباشه تو ویدیو نمیاد.
+* ticket نشست زمان‌دار هست، دانلود رو زود بعد از ضبط انجام بده.
+
+---
+
+## کد خروج
+|کد|یعنی|
+|-|-|
+|`0`|موفق|
+|`1`|خطا یا خروجی ناقص (ضبط نگه داشته میشه)|
+|`2`|ضبطی پیدا نشد یا `--length` غلط بود|
+|`130`|Ctrl+C زدی|
+
+</div>
