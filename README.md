@@ -1,4 +1,5 @@
 # Adobe Connect Downloader
+
 <div dir="rtl">
 
 یه اسکریپت پایتون که کلاس ضبط شده Adobe Connect رو دانلود میکنه و یه MP4 کامل ازش میسازه (صدا + PDF + وایت‌بورد + اشتراک صفحه).
