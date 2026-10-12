@@ -143,7 +143,8 @@ python adobe_connect_downloader.py --tools all capture_20261011_185050 --length 
 |`[DURATION] Player clock not found`|<div dir="rtl">ساعت پلیر موقع Enter تو صفحه نبود</div>|<div dir="rtl">پلیر رو باز نگه دار یا مدت رو دستی بزن</div>|
 |`[INCOMPLETE] ... segment(s)` / `holes`|<div dir="rtl">چندتا قطعه شکست خورد</div>|<div dir="rtl">همون دستور رو با همون `--outdir` دوباره بزن</div>|
 |`ffmpeg not found`|<div dir="rtl">نصب نیست</div>|<div dir="rtl">نصب کن و ترمینال رو ببند و دوباره باز کن</div>|
-|قطعه‌های کلاس قبلی استفاده شد|<div dir="rtl">`--outdir` قدیمی</div>|<div dir="rtl">`--outdir` جدید بده یا قبلی رو حذف کن</div>|
+|<div dir="rtl">قطعه‌های کلاس قبلی استفاده شد</div>|<div dir="rtl">`--outdir` قدیمی</div>|<div dir="rtl">`--outdir` جدید بده یا قبلی رو حذف کن</div>|
+|<div dir="rtl">بعد از `STEP 1/2` گیر میکنه</div>|<div dir="rtl">پروکسی سیستم یا یه Chrome دیگه با همین پروفایل باز مونده</div>|<div dir="rtl">vpnتو خاموش کن دوباره امتحان کن. اوکی نشد همه Chrome ها رو ببند (از task manager) و دوباره بزن.</div>|
 
 <div dir="rtl">
 

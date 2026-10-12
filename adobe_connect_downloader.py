@@ -58,6 +58,16 @@ def find_chrome(explicit):
     sys.exit("Chrome not found: pass --chrome PATH")
 
 
+def _local_ws_kwargs():
+    """websockets >= 15 uses the system proxy by default; never do that for Chrome on localhost."""
+    try:
+        if int(version("websockets").split(".")[0]) >= 15:
+            return {"proxy": None}
+    except Exception:
+        pass
+    return {}
+
+
 class CDP:
     def __init__(self, ws):
         self.ws = ws
@@ -77,7 +87,11 @@ class CDP:
         except Exception:
             self.pending.pop(i, None)
             return {}
-        return await fut
+        try:
+            return await asyncio.wait_for(fut, 30)
+        except asyncio.TimeoutError:
+            self.pending.pop(i, None)
+            return {}
 
 
 class State:
@@ -320,16 +334,23 @@ async def capture(args):
         *urls,
     ])
     ver = None
-    for _ in range(80):
+    local = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never use a system proxy for localhost
+    last_err = None
+    for i in range(80):
         try:
-            ver = json.load(urllib.request.urlopen(
-                f"http://127.0.0.1:{args.port}/json/version"))
+            ver = json.load(local.open(f"http://127.0.0.1:{args.port}/json/version", timeout=2))
             break
-        except Exception:
+        except Exception as e:
+            last_err = e
+            if i == 10:
+                print(f"[CAPTURE] Still waiting for Chrome's debug port {args.port} ({type(last_err).__name__}). "
+                      "If Chrome is already open: close ALL Chrome windows (check Task Manager for chrome.exe) "
+                      "and run again.", flush=True)
             await asyncio.sleep(0.5)
     if not ver:
         proc.terminate()
-        sys.exit("Chrome debug port did not open")
+        sys.exit(f"Chrome debug port {args.port} did not open ({type(last_err).__name__}: {last_err}). "
+                 "Close every Chrome process, or try another --port.")
 
     st = State(out)
     if args.match:
@@ -408,7 +429,7 @@ DURATION_PROBE_JS = r"""(() => {
 
 
 async def run_capture(websockets, ver, st, args):
-    async with websockets.connect(ver["webSocketDebuggerUrl"], max_size=None) as ws:
+    async with websockets.connect(ver["webSocketDebuggerUrl"], max_size=None, **_local_ws_kwargs()) as ws:
         cdp = CDP(ws)
         rd = asyncio.create_task(reader(cdp, st))
         await cdp.send("Target.setAutoAttach",
@@ -2851,4 +2872,4 @@ def _advanced_main(argv=None):
 if __name__ == "__main__":
     raise SystemExit(_pipeline_main())
 
-#MadMad_2854
+#MadMad_2875
