@@ -57,6 +57,25 @@ def find_chrome(explicit):
             return c
     sys.exit("Chrome not found: pass --chrome PATH")
 
+def parse_class_title(title, limit=80):
+    s = (title or "").strip()
+    if not s or re.match(r"^https?://", s, re.I):  # untitled tab: Chrome shows the URL
+        return "", ""
+    s = s.replace("ي", "ی").replace("ك", "ک")
+    s = re.sub(r"\s*[-|–—]\s*Adobe Connect\s*$", "", s, flags=re.I)
+    part = ""
+    m = re.search(r"\s*-\s*s\d{4,}.*$", s, re.I)
+    if m:
+        nums = re.findall(r"\d+", m.group(0))
+        if len(nums) > 2:
+            part = nums[-1]
+        s = s[:m.start()]
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f\u200e\u200f\u202a-\u202e]', " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    s = s.replace(" ", "_")
+    if re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM\d|LPT\d)", s, re.I):
+        s = "_" + s
+    return s[:limit].strip("_."), (part.zfill(2) if part else "")
 
 def _local_ws_kwargs():
     """websockets >= 15 uses the system proxy by default; never do that for Chrome on localhost."""
@@ -428,6 +447,20 @@ DURATION_PROBE_JS = r"""(() => {
 })()"""
 
 
+async def _get_tab_title(cdp, room_url):
+    infos = (await cdp.send("Target.getTargets")).get("targetInfos", [])
+    pages = [t for t in infos
+             if t.get("type") == "page" and not (t.get("url") or "").startswith(SKIP_SCHEMES)]
+    if room_url:
+        key = room_url.split("#")[0]
+        for t in reversed(pages):
+            if (t.get("url") or "").split("#")[0] == key and t.get("title"):
+                return t["title"]
+    for t in reversed(pages):
+        if t.get("title"):
+            return t["title"]
+    return ""
+
 async def run_capture(websockets, ver, st, args):
     async with websockets.connect(ver["webSocketDebuggerUrl"], max_size=None, **_local_ws_kwargs()) as ws:
         cdp = CDP(ws)
@@ -448,6 +481,8 @@ async def run_capture(websockets, ver, st, args):
             await asyncio.to_thread(input, "When the class is open and has played briefly, press Enter to finish capture...\n")
 
             room_url = next((u for u in reversed(st.rooms) if st.room_rx.match(u)), None)
+            args.class_title = await _get_tab_title(cdp, room_url)
+            print(f"[CLASS] Tab title: {args.class_title!r}", flush=True)
             if getattr(args, "length", None) is None:
                 page_targets = (await cdp.send("Target.getTargets")).get("targetInfos", [])
                 for info in reversed(page_targets):
@@ -1881,7 +1916,7 @@ def make_class_mp4(audio_items, video_items, out_path: Path, duration, fps=10):
     ff = shutil.which("ffmpeg")
     if not ff:
         sys.exit("ffmpeg not found on PATH")
-    cmd = [ff, "-y", "-loglevel", "error"]
+    cmd = [ff, "-y", "-loglevel", "error", "-stats"]
     for path, _ in audio_items:
         cmd += ["-i", str(path)]
     for path, _, _ in video_items:
@@ -1910,9 +1945,10 @@ def make_class_mp4(audio_items, video_items, out_path: Path, duration, fps=10):
             delay = max(0.0, start_ms / 1000.0)
             v = f"sv{j}"
             chains.append(f"[{idx}:v]setpts=PTS-STARTPTS+{delay:.6f}/TB,fps={fps:g},"
-                          f"scale=trunc(iw/2)*2:trunc(ih/2)*2,trim=start=0:end={duration:g}[{v}]")
+                          f"scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                          f"trim=start=0:end={duration:g}[{v}]")
             nxt = f"mix{j}"
-            chains.append(f"{cur}[{v}]overlay=eof_action=pass:shortest=0[{nxt}]")
+            chains.append(f"{cur}[{v}]overlay=x=(W-w)/2:y=(H-h)/2:eof_action=pass:shortest=0[{nxt}]")
             cur = f"[{nxt}]"
         chains.append(f"{cur}trim=duration={duration:g},setpts=PTS-STARTPTS[vout]")
         maps += ["-map", "[vout]"]
@@ -2688,8 +2724,9 @@ def _pipeline_main(argv=None):
     parser.add_argument("--chrome", help="explicit Chrome executable path")
     parser.add_argument("--port", type=int, default=9222, help="chrome DevTools port")
     parser.add_argument("--length", type=float, default=None, help="duration to process in seconds; asked interactively if omitted")
-    parser.add_argument("--out", default="class.mp4", help="final MP4 path")
-    parser.add_argument("--outdir", default="class_work", help="working/output directory")
+    parser.add_argument("--out", default=None, help="final MP4 path (default: <class folder>/<name>.mp4)")
+    parser.add_argument("--outdir", default=None, help="working directory (default: <class folder>/work)")
+    parser.add_argument("--root", default=".", help="parent folder where class folders are created")
     parser.add_argument("--fps", type=float, default=10, help="output frame rate")
     parser.add_argument("--conns", type=int, default=0, help="download worker/connection management (0=automatic; default:auto)")
     parser.add_argument("--jobs", type=int, default=1, help="parallel segments per stream")
@@ -2710,11 +2747,8 @@ def _pipeline_main(argv=None):
         parser.error("unknown arguments: " + " ".join(remainder) + " (advanced commands: add --tools)")
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    cap = Path(args.capture_dir or f"capture_{stamp}").resolve()
-    work = Path(args.outdir).resolve()
-    out = Path(args.out).resolve()
+    cap = Path(args.capture_dir or f"capture_{stamp}").resolve()  # temporary until class name is known
     cap.mkdir(parents=True, exist_ok=True)
-    work.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(cap, 0o700)  # capture holds session cookies/tickets (no effect on Windows)
     except OSError:
@@ -2724,8 +2758,6 @@ def _pipeline_main(argv=None):
     print("Adobe Connect Downloader")
     print("=" * 26)
     print(f"Recording URL : {args.url}")
-    print(f"Capture folder: {cap}")
-    print(f"Output video  : {out}")
     print()
     print("STEP 1/2 — Capture browser traffic")
     print("Chrome will open. Follow the capture prompt, then press Enter after pausing the recording.")
@@ -2743,6 +2775,27 @@ def _pipeline_main(argv=None):
     if not list_ws(cap):
         print(f"No WebSocket capture files found in {cap}. Nothing to process.")
         return 2
+
+    course, part = parse_class_title(getattr(capture_args, "class_title", ""))
+    course = course or f"class_{stamp}"
+    class_name = f"{course}-{part}" if part else course
+    class_dir = Path(args.root).resolve() / course / (f"قسمت_{part}" if part else "")
+    class_dir.mkdir(parents=True, exist_ok=True)
+    new_cap = class_dir / "capture"
+    if new_cap.exists():
+        shutil.rmtree(new_cap, ignore_errors=True)
+        if new_cap.exists():   # locked or long-path leftovers: use a fresh name instead of fighting Windows
+            new_cap = class_dir / f"capture_{stamp}"
+    try:
+        shutil.move(str(cap), str(new_cap))
+        cap = new_cap
+    except OSError as exc:
+        print(f"[WARN] Could not move capture folder ({exc}); leaving it at {cap}")
+    work = Path(args.outdir).resolve() if args.outdir else class_dir / "work"
+    out = Path(args.out).resolve() if args.out else class_dir / f"{class_name}.mp4"
+    work.mkdir(parents=True, exist_ok=True)
+    print(f"[CLASS] Folder: {class_dir}")
+    print(f"        Output: {out}")
 
     if args.length is None:
         if capture_args.length is not None:
