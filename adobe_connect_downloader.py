@@ -13,6 +13,7 @@ requirements: Python 3.10+, websockets, ffmpeg; pymupdf and pillow for PDF/White
 import argparse
 import asyncio
 import base64
+import bisect
 import builtins
 import json
 import math
@@ -1926,7 +1927,7 @@ def make_class_mp4(audio_items, video_items, out_path: Path, duration, fps=10):
     for i, (_, start_ms) in enumerate(audio_items):
         delay = max(0, int(round(start_ms)))
         label = f"a{i}"
-        chains.append(f"[{i}:a]aresample=48000,adelay={delay}:all=1[{label}]")
+        chains.append(f"[{i}:a]aresample=48000:async=1000:min_hard_comp=0.1:first_pts=0,adelay={delay}:all=1[{label}]")
         audio_labels.append(f"[{label}]")
     if audio_labels:
         chains.append("".join(audio_labels) +
@@ -2126,6 +2127,7 @@ async def run_specs(ctx, specs, partsdir: Path, extras: Path, fresh=False):
     if fresh and partsdir.exists():
         shutil.rmtree(partsdir)
     partsdir.mkdir(parents=True, exist_ok=True)
+    _drop_empty_holes(partsdir)
     requested = ctx["conns"]
     # Automatic mode scales workers for this capture without requiring multiple browser sessions.
     worker_limit = max(1, min(4, len(specs) if requested <= 0 else requested))
@@ -2383,6 +2385,645 @@ def pick_video_streams(starts, media_by_name):
     return sorted((t, n) for n, t in out.items())
 
 
+def _iter_play_events(cap: Path):
+    """Yield (time_s, event_name, changes) for every playEvent in the captured buffers, de-duplicated."""
+    dec = json.JSONDecoder()
+    needle = '{"cmdString":"playEvent"'
+    seen = set()
+    for recv_path in sorted(cap.glob("ws*.recv.bin")):
+        raw = recv_path.read_bytes().decode("utf-8", "ignore")
+        pos = 0
+        while True:
+            pos = raw.find(needle, pos)
+            if pos < 0:
+                break
+            try:
+                obj, end = dec.raw_decode(raw, pos)
+            except Exception:
+                pos += len(needle)
+                continue
+            pos = max(end, pos + len(needle))
+            params = obj.get("params") if isinstance(obj, dict) else None
+            if not isinstance(params, dict):
+                continue
+            a0, ev, ch = params.get("arg_0"), params.get("arg_1"), params.get("arg_2")
+            if not isinstance(a0, dict):
+                continue
+            try:
+                t = float(a0.get("time")) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            if not (isinstance(ev, str) and isinstance(ch, list)):
+                # state snapshots (e.g. what was already shared when the recording started)
+                snap = [x for x in (ev, ch) if isinstance(x, (dict, list))]
+                if not snap:
+                    continue
+                ev, ch = "__state__", snap
+            key = hash((round(t, 3), ev, json.dumps(ch, sort_keys=True, separators=(",", ":"), ensure_ascii=False)))
+            if key in seen:
+                continue
+            seen.add(key)
+            yield t, ev, ch
+
+_CONTENT_ID_RX = re.compile(r"/(p[a-z0-9]{11})/")
+
+def _first_content_id(text):
+    for m in _CONTENT_ID_RX.finditer(text or ""):
+        if any(c.isdigit() for c in m.group(1)):
+            return m.group(1)
+    return None
+
+def _collect_content(val, t, items, docs):
+    """Walk a setContentSo value: content items (ctID) and document descriptors (originatingSco)."""
+    if isinstance(val, dict):
+        if "ctID" in val and ("shareType" in val or "documentDescriptor" in val):
+            try:
+                k = int(float(val["ctID"]))
+            except (TypeError, ValueError):
+                k = None
+            if k is not None:
+                it = items.setdefault(k, {"kind": "other", "sco": None, "t": t})
+                if val.get("shareType") == "wb":
+                    it["kind"] = "wb"
+                dd = val.get("documentDescriptor")
+                if isinstance(dd, dict) and dd.get("scoID") is not None:
+                    it["kind"], it["sco"] = "doc", str(dd["scoID"])
+        if val.get("originatingSco") is not None:
+            info = docs.setdefault(str(val["originatingSco"]),
+                                   {"name": "", "playback_id": None, "content_id": None, "t": t})
+            if val.get("theName"):
+                info["name"] = str(val["theName"])
+            for field, slot in (("playbackContentOutputPath", "playback_id"), ("contentOutputPath", "content_id")):
+                found_id = _first_content_id(str(val.get(field) or ""))
+                if found_id:
+                    info[slot] = found_id
+        for v in val.values():
+            _collect_content(v, t, items, docs)
+    elif isinstance(val, list):
+        for v in val:
+            _collect_content(v, t, items, docs)
+
+def extract_share_state(cap: Path):
+    """What the Share pod showed and when, read from the recorded events.
+    timeline: [(t, ctID)] active content (-1 = nothing); items: ctID -> wb/doc/other (+ document sco);
+    docs: sco -> name + content ids of the PDF; mementos: [(t, 0-based page)]; wb_on: [(t, bool)] overlay."""
+    timeline, items, docs, mementos, wb_on = [], {}, {}, [], []
+    for t, ev, changes in _iter_play_events(cap):
+        if ev == "__state__":
+            for obj in changes:
+                _collect_content(obj, t, items, docs)
+            continue
+        if ev not in ("setContentSo", "setPdfContentSo", "setControlsSo"):
+            continue
+        for c in changes:
+            if not isinstance(c, dict):
+                continue
+            name, val = str(c.get("name")), c.get("newValue")
+            if ev == "setContentSo":
+                if name == "ctID":
+                    try:
+                        timeline.append((t, int(float(val))))
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    _collect_content(val, t, items, docs)
+            elif ev == "setPdfContentSo" and name == "memento":
+                m = re.search(r"(?:^|\|)tPgNum-(\d+)(?:\||$)", str(val))
+                if m:
+                    mementos.append((t, int(m.group(1))))
+            elif ev == "setControlsSo" and name == "wbOn":
+                wb_on.append((t, bool(val)))
+    timeline.sort(key=lambda x: x[0])
+    dedup = []
+    for t, k in timeline:
+        if not dedup or dedup[-1][1] != k:
+            dedup.append((t, k))
+    return {"timeline": dedup, "items": items, "docs": docs,
+            "mementos": sorted(mementos), "wb_on": sorted(wb_on)}
+
+def _drop_empty_holes(partsdir: Path):
+    """An empty .seg means the server sent nothing for that range. That is normal only after the end of an
+    audio stream; anywhere else it is a hole (or a failed video download), so delete it and fetch it again."""
+    dropped = []
+    for d in sorted(p for p in partsdir.iterdir() if p.is_dir()):
+        segs = sorted(d.glob("*.seg"))
+        sizes = [p.stat().st_size for p in segs]
+        last_data = max((i for i, z in enumerate(sizes) if z > 0), default=-1)
+        for i, (p, z) in enumerate(zip(segs, sizes)):
+            if z == 0 and (i < last_data or not d.name.startswith("cameraVoip")):
+                try:
+                    p.unlink()
+                    dropped.append(f"{d.name}/{p.name[:4]}")
+                except OSError:
+                    pass
+    if dropped:
+        print(f"[RETRY] {len(dropped)} empty segment(s) from an earlier run will be downloaded again: "
+              f"{', '.join(dropped[:8])}{' ...' if len(dropped) > 8 else ''}", flush=True)
+
+def _flv_last_ts(path: Path):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(-4, 2)
+            size = int.from_bytes(fh.read(4), "big")
+            fh.seek(-4 - size, 2)
+            hdr = fh.read(8)
+        return (int.from_bytes(hdr[4:7], "big") | (hdr[7] << 24)) / 1000.0
+    except (OSError, ValueError):
+        return None
+
+def report_stream_ends(cap: Path, outdir: Path, audio_t, video_t, duration):
+    """Where each downloaded stream starts and ends on the class timeline, to spot a missing tail."""
+    print(f"[END-CHECK] class length {duration:.1f}s (player clock or --length)", flush=True)
+    audio_end = 0.0
+    for name, start_ms in list(audio_t.items()) + list(video_t.items()):
+        flv = outdir / (name.strip("/") + ".flv")
+        last = _flv_last_ts(flv) if flv.exists() else None
+        if last is None:
+            continue
+        end = start_ms / 1000.0 + last
+        if name in audio_t:
+            audio_end = max(audio_end, end)
+        print(f"  {flv.name}: {start_ms / 1000.0:.1f}s -> {end:.1f}s", flush=True)
+    try:
+        latest = max(t for t, _, _ in _iter_play_events(cap))
+    except ValueError:
+        latest = None
+    if latest is not None:
+        print(f"  last recorded event: {latest:.1f}s", flush=True)
+        if latest > duration + 3:
+            print(f"[WARN] events run {latest - duration:.0f}s past the class length: the recording is longer than "
+                  f"{duration:.0f}s. Enter the full length (or use --length {latest + 5:.0f}).", flush=True)
+    if audio_end and audio_end < duration - 15:
+        print(f"[WARN] the last audio ends {duration - audio_end:.0f}s before the class end "
+              "(missing audio at the tail, or a stream that was never listed).", flush=True)
+
+def _item_label(state, k):
+    it = state["items"].get(k)
+    if it is None:
+        return "nothing shared"
+    if it["kind"] == "wb":
+        return f"whiteboard #{k}"
+    if it["kind"] == "doc":
+        name = (state["docs"].get(it["sco"]) or {}).get("name") or f"document sco {it['sco']}"
+        return f"PDF #{k}: {name[:60]}"
+    return f"other share #{k}"
+
+def print_content_timeline(state):
+    print("[CONTENT] what was on screen (from the recording's own events):", flush=True)
+    for t, k in state["timeline"][:80]:
+        print(f"  {t:8.1f}s  {_item_label(state, k)}", flush=True)
+
+def _server_origin(cap: Path):
+    base = None
+    rp = cap / "rooms.jsonl"
+    if rp.exists():
+        for line in rp.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                base = json.loads(line).get("url")
+                if base:
+                    break
+            except Exception:
+                pass
+    if not base:
+        for mp in sorted(cap.glob("ws*.meta.json")):
+            try:
+                base = json.loads(mp.read_text(encoding="utf-8")).get("url")
+                if base:
+                    break
+            except Exception:
+                pass
+    if not base:
+        return ""
+    u = urlparse(base)
+    scheme = {"wss": "https", "ws": "http"}.get(u.scheme, u.scheme or "https")
+    return f"{scheme}://{u.netloc}" if u.netloc else ""
+
+def _pdf_ok(path: Path):
+    try:
+        if path.stat().st_size < 1000:
+            return False
+        with open(path, "rb") as fh:
+            if fh.read(5) != b"%PDF-":
+                return False
+    except OSError:
+        return False
+    try:
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz
+    except ImportError:
+        return True
+    try:
+        doc = fitz.open(str(path))
+        n = len(doc)
+        doc.close()
+        return n > 0
+    except Exception:
+        return False
+
+def resolve_share_pdfs(cap: Path, outdir: Path, state):
+    """sco -> PDF file for every shared document. Order: content id from the descriptor, looked up in the
+    capture's cached responses, then downloaded as /<id>/default/connect.pdf (what the player itself loads)
+    with the captured cookie. A document without any id is paired only when it is the single unmatched
+    document and the player loaded exactly one other PDF (never a guess between several)."""
+    by_id, http_ids = {}, set()
+    meta = cap / "assets.jsonl"
+    if meta.exists():
+        for line in meta.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            url, f = str(row.get("url", "")), row.get("file")
+            i = _first_content_id(urlparse(url).path)
+            if f and i and ".pdf" in url.lower():
+                by_id.setdefault(i, []).append(cap / f)
+    hp = cap / "http.jsonl"
+    if hp.exists():
+        for line in hp.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                url = str(json.loads(line).get("url") or "")
+            except Exception:
+                continue
+            i = _first_content_id(urlparse(url).path)
+            if i and url.split("?")[0].lower().endswith(".pdf"):
+                http_ids.add(i)
+    for paths in by_id.values():
+        paths.sort(key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+    cache = outdir / "pdfs"
+    origin = _server_origin(cap)
+    auth = {}
+
+    def obtain(ids):
+        for i in ids:
+            c = cache / f"{i}.pdf"
+            if c.exists() and _pdf_ok(c):
+                return c, "cached", i
+        for i in ids:
+            for p in by_id.get(i, []):
+                if _pdf_ok(p):
+                    return p, "from capture", i
+        if origin and ids:
+            if not auth:
+                auth["cookie"], auth["allowed"] = capture_cookie(cap) or "", cookie_hosts(cap)
+            hdr = {"User-Agent": "Mozilla/5.0", "Referer": origin + "/"}
+            for i in ids:
+                for url in (f"{origin}/{i}/default/connect.pdf", f"{origin}/_a7/{i}/default/connect.pdf"):
+                    try:
+                        with open_url(url, hdr, auth["cookie"], auth["allowed"]) as r:
+                            data = r.read()
+                        if not data.startswith(b"%PDF-"):
+                            continue
+                        cache.mkdir(parents=True, exist_ok=True)
+                        dest = cache / f"{i}.pdf"
+                        tmp = dest.with_suffix(".part")
+                        tmp.write_bytes(data)
+                        os.replace(tmp, dest)
+                        if _pdf_ok(dest):
+                            return dest, f"downloaded {len(data) / 1e6:.1f} MB", i
+                    except Exception:
+                        continue
+        return None, "", None
+
+    out, unresolved, claimed = {}, [], set()
+    for it in state["items"].values():
+        sco = it.get("sco")
+        if it["kind"] != "doc" or not sco or sco in out or any(sco == u[0] for u in unresolved):
+            continue
+        info = state["docs"].get(sco) or {}
+        ids = [i for i in (info.get("playback_id"), info.get("content_id")) if i]
+        name = (info.get("name") or f"document sco {sco}")[:50]
+        found, how, used = obtain(ids)
+        if found:
+            out[sco] = found
+            claimed.add(used)
+            print(f"[PDF] {name}: {how}", flush=True)
+        else:
+            unresolved.append((sco, name, ids))
+    free = sorted((set(by_id) | http_ids) - claimed)
+    if unresolved and len(unresolved) == 1 and len(free) == 1:
+        sco, name, ids = unresolved[0]
+        found, how, used = obtain([free[0]])
+        if found:
+            out[sco] = found
+            print(f"[PDF] {name}: paired with the only PDF the player loaded ({used}); {how}", flush=True)
+            unresolved = []
+        else:
+            print(f"[PDF] the only PDF the player loaded ({free[0]}) could not be read or downloaded", flush=True)
+    elif unresolved and free:
+        print(f"[PDF] cannot pair safely: {len(unresolved)} document(s) without a file id, "
+              f"PDFs loaded by the player: {', '.join(free)}", flush=True)
+    for sco, name, ids in unresolved:
+        print(f"[PDF] {name}: NOT AVAILABLE (ids tried: {', '.join(ids) or 'none'}); a placeholder is shown", flush=True)
+    return out
+
+
+class _WhiteboardState:
+    """Pencil strokes. Each stroke is tagged with the content (ctID) on screen when it was drawn and, on a PDF,
+    the page that was showing. A stroke is only drawn on the content it was drawn on."""
+    W, H = 960, 720
+
+    def __init__(self):
+        self.records = {}          # (ctx, store, shape id) -> {"shape", "ctx", "pg"}
+        self.by_ctx = {}           # ctx -> records in drawing order
+        self.page, self.scale = None, 1.2      # whiteboard page (setWBSo currentPage)
+        self.layer = self.draw = None
+        self.view, self.pending, self.need_full, self.drawn = None, [], True, 0
+
+    @staticmethod
+    def _abs(shape):
+        try:
+            x0, y0 = float(shape.get("x", 0)), float(shape.get("y", 0))
+            sw, sh = float(shape.get("width", 0)), float(shape.get("height", 0))
+            return [(x0 + float(p.get("x", 0)) * sw, y0 + float(p.get("y", 0)) * sh)
+                    for p in shape.get("pts", [])]
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    @classmethod
+    def _extends(cls, old, new):
+        if new.get("type") != "pencil" or old.get("type") != "pencil":
+            return False
+        a, b = cls._abs(old), cls._abs(new)
+        return (a is not None and b is not None and len(b) >= len(a)
+                and all(abs(p[0] - q[0]) < 0.05 and abs(p[1] - q[1]) < 0.05 for p, q in zip(a, b))
+                and old.get("strokeCol") == new.get("strokeCol")
+                and old.get("strokeWeight") == new.get("strokeWeight")
+                and old.get("currentPage") == new.get("currentPage"))
+
+    def apply(self, event_name, changes, ctx, doc_page):
+        """Apply one recorded event. ctx = content on screen when it happened, doc_page = PDF page then.
+        Returns (set of contents whose strokes changed, whiteboard page changed)."""
+        touched, page_changed = set(), False
+        if event_name == "setWBSo":
+            for c in changes:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("name") == "nativeWidth":
+                    try:
+                        self.scale = self.W / float(c.get("newValue"))
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        pass
+                elif c.get("name") == "currentPage":
+                    try:
+                        page = int(float(c.get("newValue")))
+                    except (TypeError, ValueError):
+                        continue
+                    if page != self.page:
+                        self.page, page_changed = page, True
+            return touched, page_changed
+        store = event_name.rsplit("_", 1)[-1]
+        for c in changes:
+            if not isinstance(c, dict):
+                continue
+            sid, val = str(c.get("name", "")), c.get("newValue")
+            if not sid:
+                continue
+            key = (ctx, store, sid)
+            if c.get("code") in ("delete", "remove") or val is None:
+                if (c.get("code") in ("delete", "remove") or c.get("oldValue") is not None) and key in self.records:
+                    rec = self.records.pop(key)
+                    self.by_ctx[ctx] = [r for r in self.by_ctx.get(ctx, []) if r is not rec]
+                    self.need_full = True
+                    touched.add(ctx)
+                continue
+            if not (isinstance(val, dict) and val.get("type")):
+                continue
+            old = self.records.get(key)
+            if old is None:
+                rec = {"shape": val, "ctx": ctx, "pg": doc_page}
+                self.records[key] = rec
+                self.by_ctx.setdefault(ctx, []).append(rec)
+                self.pending.append(rec)
+            else:
+                if self._extends(old["shape"], val):
+                    self.pending.append(old)
+                else:
+                    self.need_full = True
+                old["shape"] = val
+            touched.add(ctx)
+        if len(self.pending) > 300:
+            self.pending, self.need_full = [], True
+        return touched, page_changed
+
+    def _matches(self, rec, view):
+        if view[0] == "doc":
+            return rec["pg"] == view[2]
+        if self.page is None:
+            return True
+        try:
+            return int(float(rec["shape"].get("currentPage", self.page))) == self.page
+        except (TypeError, ValueError):
+            return True
+
+    def _draw_shape(self, shape):
+        if shape.get("type") != "pencil":
+            return
+        try:
+            pts = self._abs(shape)
+            if not pts or len(pts) < 2:
+                return
+            s = self.scale
+            rgb = int(float(shape.get("strokeCol", 0)))
+            self.draw.line([(round(x * s), round(y * s)) for x, y in pts],
+                           fill=((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, 255),
+                           width=max(2, round(float(shape.get("strokeWeight", 2)) * s)), joint="curve")
+            self.drawn += 1
+        except (TypeError, ValueError, OverflowError):
+            return
+
+    def sync(self, view, Image, ImageDraw):
+        """Stroke layer for one view ("wb", ctx, page) or ("doc", ctx, pdf page); incremental when possible."""
+        if self.layer is None or view != self.view or self.need_full:
+            self.layer = Image.new("RGBA", (self.W, self.H), (0, 0, 0, 0))
+            self.draw = ImageDraw.Draw(self.layer)
+            self.drawn = 0
+            for rec in self.by_ctx.get(view[1], []):
+                if self._matches(rec, view):
+                    self._draw_shape(rec["shape"])
+            self.view, self.pending, self.need_full = view, [], False
+        elif self.pending:
+            for rec in self.pending:
+                if rec["ctx"] == view[1] and self._matches(rec, view):
+                    self._draw_shape(rec["shape"])
+            self.pending = []
+        return self.layer
+
+
+def render_content_timeline(cap: Path, out_path: Path, duration: float, fps: float, state, pdf_by_sco,
+                            draw_wb=True):
+    """One pass for everything the Share pod showed:
+      screen share      -> black (the screen-share video is laid over it separately)
+      PDF               -> the page that was showing, with the pencil strokes drawn on it (transparent layer)
+      anything else     -> the whiteboard: white page with the pencil strokes of that whiteboard."""
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        print("content render skipped: ffmpeg not found")
+        return False
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        print("content render skipped: Pillow is not installed (pip install pillow)")
+        return False
+    fitz = None
+    if pdf_by_sco:
+        try:
+            try:
+                import pymupdf as fitz
+            except ImportError:
+                import fitz
+        except ImportError:
+            print("PDFs found, but showing them needs PyMuPDF: python -m pip install pymupdf")
+
+    W, H = 1280, 720
+    WB_X = (W - _WhiteboardState.W) // 2
+    events = extract_whiteboard_events(cap) if draw_wb else []
+    wb = _WhiteboardState()
+    items = state["items"]
+    tl_t = [t for t, _ in state["timeline"]]
+    tl_k = [k for _, k in state["timeline"]]
+
+    def active(t):
+        i = bisect.bisect_right(tl_t, t) - 1
+        return tl_k[i] if i >= 0 else None
+
+    def kind_of(k):
+        return items.get(k, {}).get("kind") if k is not None else None
+
+    pages = {}                               # ctID -> [(t, page)] page position of that document
+    for t, p in state["mementos"]:
+        k = active(t)
+        if kind_of(k) == "doc":
+            pages.setdefault(k, []).append((t, p))
+    page_t = {k: [t for t, _ in v] for k, v in pages.items()}
+
+    def doc_page(k, t):
+        lst = pages.get(k)
+        if not lst:
+            return 0
+        i = bisect.bisect_right(page_t[k], t) - 1
+        return lst[i][1] if i >= 0 else 0
+
+    open_docs, page_cache, notes = {}, {}, {}
+    white = Image.new("RGB", (W, H), "white").tobytes()
+    black = bytes(W * H * 3)
+    try:
+        font = ImageFont.load_default(size=30)
+    except Exception:
+        font = ImageFont.load_default()
+
+    def get_doc(k):
+        if k not in open_docs:
+            doc = None
+            path = pdf_by_sco.get(items.get(k, {}).get("sco"))
+            if fitz is not None and path:
+                try:
+                    doc = fitz.open(str(path))
+                except Exception as e:
+                    print(f"PDF open failed for {path.name}: {e}")
+            open_docs[k] = doc if doc is not None and len(doc) else None
+        return open_docs[k]
+
+    def note_frame(k):
+        if k not in notes:
+            im = Image.new("RGB", (W, H), "white")
+            label = _item_label(state, k) + " (file not available)"
+            ImageDraw.Draw(im).text((40, 40), label, fill=(120, 120, 120), font=font)
+            notes[k] = im.tobytes()
+        return notes[k]
+
+    def page_frame(k, p):
+        doc = get_doc(k)
+        if doc is None:
+            return note_frame(k)
+        p = max(0, min(len(doc) - 1, p))
+        if (k, p) not in page_cache:
+            if len(page_cache) >= 8:                  # keep memory small (about 2.7 MB per page)
+                page_cache.pop(next(iter(page_cache)))
+            pix = doc.load_page(p).get_pixmap(matrix=fitz.Matrix(1.6, 1.6), alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            img.thumbnail((W - 48, H - 48))
+            canvas = Image.new("RGB", (W, H), "white")
+            canvas.paste(img, ((W - img.width) // 2, (H - img.height) // 2))
+            page_cache[(k, p)] = canvas.tobytes()
+        return page_cache[(k, p)]
+
+    def with_strokes(base, view):
+        layer = wb.sync(view, Image, ImageDraw)
+        if not wb.drawn:
+            return base
+        im = Image.frombytes("RGB", (W, H), base)
+        im.paste(layer, (WB_X, 0), layer)
+        return im.tobytes()
+
+    cmd = [ff, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+           "-s", f"{W}x{H}", "-r", f"{fps:g}", "-i", "-",
+           "-an", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-crf", "20",
+           "-pix_fmt", "yuv420p", "-t", f"{duration:g}", "-movflags", "+faststart", str(out_path)]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    total = max(1, int(math.ceil(duration * fps)))
+    ev_i, dirty, cur_key, data = 0, set(), None, white
+    try:
+        for fi in range(total):
+            t = (fi + 0.5) / fps        # state in the middle of this frame's slot: error is +-half a frame
+            while ev_i < len(events) and events[ev_i][0] <= t * 1000.0:
+                te = events[ev_i][0] / 1000.0
+                kc = active(te)
+                touched, _ = wb.apply(events[ev_i][1], events[ev_i][2], kc,
+                                      doc_page(kc, te) if kind_of(kc) == "doc" else None)
+                dirty |= touched
+                ev_i += 1
+            k = active(t)
+            kind = kind_of(k)
+            if kind == "other":
+                key = ("black",)
+            elif kind == "doc":
+                key = ("doc", k, doc_page(k, t))
+            else:
+                key = ("wb", k, wb.page)
+            if key != cur_key or (key[0] in ("doc", "wb") and k in dirty):
+                if key[0] == "black":
+                    data = black
+                elif key[0] == "doc":
+                    data = page_frame(k, key[2])
+                    if draw_wb:
+                        data = with_strokes(data, key)
+                else:
+                    data = with_strokes(white, key) if draw_wb else white
+                cur_key = key
+                dirty.discard(k)
+            try:
+                proc.stdin.write(data)
+            except BrokenPipeError:
+                break
+            if fi and fi % max(1, int(fps * 10)) == 0:
+                UI.line(f"Rendering content: {fi}/{total} frames ({fi * 100 // total}%)")
+        UI.end()
+        if proc.stdin:
+            proc.stdin.close()
+        rc = proc.wait()
+    except Exception as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        print(f"content render failed: {type(e).__name__}: {e}")
+        return False
+    finally:
+        for d in open_docs.values():
+            try:
+                if d is not None:
+                    d.close()
+            except Exception:
+                pass
+    if rc == 0 and out_path.exists() and out_path.stat().st_size > 1000:
+        print(f"Content timeline rendered: {out_path.name}")
+        return True
+    print("content timeline creation failed")
+    return False
+
+
 async def cmd_all(a):
     ctx = build_ctx(a)
     names, starts = collect_streams(ctx["frames"])
@@ -2484,91 +3125,108 @@ async def cmd_all(a):
             duration = max(1.0, duration)
             print(f"ffprobe not found; estimated class duration from captured frame timestamps: {duration:.1f}s")
 
-    # Resolve and download PDF descriptors from the actual shared-content events.
-    descriptors, cached_assets = inspect_pdf_resources(Path(a.cap))
-    pdf_files = download_pdf_descriptors(Path(a.cap), outdir / "files", descriptors)
+    # Everything the Share pod showed (PDFs and whiteboard) comes from the recording's own events.
+    report_stream_ends(Path(a.cap), outdir, audio_t, video_t, duration)
+    content_ok = False
+    state = extract_share_state(Path(a.cap))
+    if state["timeline"] and state["items"]:
+        print_content_timeline(state)
+        t_content = time.time()
+        pdf_by_sco = resolve_share_pdfs(Path(a.cap), outdir, state)
+        content_path = outdir / "content_timeline.mp4"
+        if render_content_timeline(Path(a.cap), content_path, duration, a.fps, state, pdf_by_sco,
+                                   draw_wb=not a.no_whiteboard):
+            video_items.insert(0, (content_path, 0.0, "content"))
+            content_ok = True
+        print(f"[TIME] PDF + whiteboard render: {time.time() - t_content:.0f}s", flush=True)
+    else:
+        print("[CONTENT] no content-switch events in this capture; using the older PDF/whiteboard logic.", flush=True)
+    if not content_ok:
+        # Resolve and download PDF descriptors from the actual shared-content events.
+        descriptors, cached_assets = inspect_pdf_resources(Path(a.cap))
+        pdf_files = download_pdf_descriptors(Path(a.cap), outdir / "files", descriptors)
 
-    # Some Adobe Connect rooms expose a descriptor URL (/system/download?...)
-    # that returns an HTML error page even though the same PDF was successfully
-    # captured from the viewer's connect.pdf endpoint by fetch_files(). In that
-    # case, reuse verified PDF files already downloaded into outdir/files.
-    # Validate by PDF magic bytes and de-duplicate identical downloads.
-    import hashlib
-    known_hashes = set()
-    for _, existing_pdf in pdf_files:
-        try:
-            known_hashes.add(hashlib.sha256(existing_pdf.read_bytes()).hexdigest())
-        except OSError:
-            pass
-    fallback_pdfs = []
-    files_dir = outdir / "files"
-    if files_dir.exists():
-        for candidate in sorted(files_dir.glob("*.pdf")):
+        # Some Adobe Connect rooms expose a descriptor URL (/system/download?...)
+        # that returns an HTML error page even though the same PDF was successfully
+        # captured from the viewer's connect.pdf endpoint by fetch_files(). In that
+        # case, reuse verified PDF files already downloaded into outdir/files.
+        # Validate by PDF magic bytes and de-duplicate identical downloads.
+        import hashlib
+        known_hashes = set()
+        for _, existing_pdf in pdf_files:
             try:
-                data = candidate.read_bytes()
-                if len(data) < 1000 or not data.startswith(b"%PDF-"):
+                known_hashes.add(hashlib.sha256(existing_pdf.read_bytes()).hexdigest())
+            except OSError:
+                pass
+        fallback_pdfs = []
+        files_dir = outdir / "files"
+        if files_dir.exists():
+            for candidate in sorted(files_dir.glob("*.pdf")):
+                try:
+                    data = candidate.read_bytes()
+                    if len(data) < 1000 or not data.startswith(b"%PDF-"):
+                        continue
+                    digest = hashlib.sha256(data).hexdigest()
+                    if digest in known_hashes:
+                        continue
+                    known_hashes.add(digest)
+                    fallback_pdfs.append(candidate)
+                except OSError:
                     continue
-                digest = hashlib.sha256(data).hexdigest()
+        missing_descriptors = [d for d in descriptors
+                               if not any(str(d.get("name", "")) == str(saved_d.get("name", ""))
+                                          for saved_d, _ in pdf_files)]
+        if missing_descriptors and fallback_pdfs:
+            # If one unique PDF was fetched from the viewer endpoint, it is the
+            # strongest available fallback for the descriptor whose direct URL failed.
+            if len(fallback_pdfs) == 1 and len(missing_descriptors) == 1:
+                pdf_files.append((missing_descriptors[0], fallback_pdfs[0]))
+                print(f"PDF fallback: using verified viewer download {fallback_pdfs[0].name} "
+                      f"for {missing_descriptors[0].get('name') or 'shared PDF'}")
+            else:
+                for desc, candidate in zip(missing_descriptors, fallback_pdfs):
+                    pdf_files.append((desc, candidate))
+                    print(f"PDF fallback: using verified viewer download {candidate.name} "
+                          f"for {desc.get('name') or 'shared PDF'}")
+        if cached_assets:
+            for asset in cached_assets:
+                if asset.suffix.lower() != ".pdf" or asset.stat().st_size <= 1000:
+                    continue
+                try:
+                    data = asset.read_bytes()
+                    if not data.startswith(b"%PDF-"):
+                        continue
+                    digest = hashlib.sha256(data).hexdigest()
+                except OSError:
+                    continue
                 if digest in known_hashes:
                     continue
                 known_hashes.add(digest)
-                fallback_pdfs.append(candidate)
-            except OSError:
-                continue
-    missing_descriptors = [d for d in descriptors
-                           if not any(str(d.get("name", "")) == str(saved_d.get("name", ""))
-                                      for saved_d, _ in pdf_files)]
-    if missing_descriptors and fallback_pdfs:
-        # If one unique PDF was fetched from the viewer endpoint, it is the
-        # strongest available fallback for the descriptor whose direct URL failed.
-        if len(fallback_pdfs) == 1 and len(missing_descriptors) == 1:
-            pdf_files.append((missing_descriptors[0], fallback_pdfs[0]))
-            print(f"PDF fallback: using verified viewer download {fallback_pdfs[0].name} "
-                  f"for {missing_descriptors[0].get('name') or 'shared PDF'}")
-        else:
-            for desc, candidate in zip(missing_descriptors, fallback_pdfs):
-                pdf_files.append((desc, candidate))
-                print(f"PDF fallback: using verified viewer download {candidate.name} "
-                      f"for {desc.get('name') or 'shared PDF'}")
-    if cached_assets:
-        for asset in cached_assets:
-            if asset.suffix.lower() != ".pdf" or asset.stat().st_size <= 1000:
-                continue
-            try:
-                data = asset.read_bytes()
-                if not data.startswith(b"%PDF-"):
-                    continue
-                digest = hashlib.sha256(data).hexdigest()
-            except OSError:
-                continue
-            if digest in known_hashes:
-                continue
-            known_hashes.add(digest)
-            pdf_files.append(({"name": asset.name, "time": 0.0}, asset))
-    pdf_path = outdir / "pdf_timeline.mp4"
-    pdf_rendered = False
-    if pdf_files and render_pdf_timeline(pdf_files, pdf_path, duration, a.fps, Path(a.cap)):
-        pdf_rendered = True
-        # PDF content sits below Whiteboard annotations and captured screen-share/video.
-        video_items.insert(0, (pdf_path, min((float(d.get("time") or 0.0) for d, _ in pdf_files), default=0.0) * 1000.0, "pdf"))
+                pdf_files.append(({"name": asset.name, "time": 0.0}, asset))
+        pdf_path = outdir / "pdf_timeline.mp4"
+        pdf_rendered = False
+        if pdf_files and render_pdf_timeline(pdf_files, pdf_path, duration, a.fps, Path(a.cap)):
+            pdf_rendered = True
+            # PDF content sits below Whiteboard annotations and captured screen-share/video.
+            video_items.insert(0, (pdf_path, min((float(d.get("time") or 0.0) for d, _ in pdf_files), default=0.0) * 1000.0, "pdf"))
 
-    print(f"[PDF] shared PDFs found: {len(descriptors)}, usable files: {len(pdf_files)}, "
-          f"rendered into video: {'yes' if pdf_rendered else 'NO'}", flush=True)
-    if not pdf_rendered and (descriptors or pdf_files or cached_assets):
-        print("[PDF] WARNING: a PDF was shared but could not be rendered; the white page in the video "
-              "is the Whiteboard background. See the PDF messages above for the reason.", flush=True)
+        print(f"[PDF] shared PDFs found: {len(descriptors)}, usable files: {len(pdf_files)}, "
+              f"rendered into video: {'yes' if pdf_rendered else 'NO'}", flush=True)
+        if not pdf_rendered and (descriptors or pdf_files or cached_assets):
+            print("[PDF] WARNING: a PDF was shared but could not be rendered; the white page in the video "
+                  "is the Whiteboard background. See the PDF messages above for the reason.", flush=True)
 
-    # Do not infer that Whiteboard is absent just because a PDF was shared too.
-    # When both are present, render the Whiteboard strokes with alpha and place
-    # them above the PDF so the document remains visible underneath.
-    if not a.no_whiteboard:
-        transparent_wb = pdf_rendered
-        wb_path = outdir / ("whiteboard_timeline.mov" if transparent_wb else "whiteboard_timeline.mp4")
-        if render_whiteboard_video(Path(a.cap), wb_path, duration, a.fps, transparent=transparent_wb):
-            if pdf_rendered:
-                video_items.insert(1, (wb_path, 0.0, "whiteboard"))
-            else:
-                video_items.insert(0, (wb_path, 0.0, "whiteboard"))
+        # Do not infer that Whiteboard is absent just because a PDF was shared too.
+        # When both are present, render the Whiteboard strokes with alpha and place
+        # them above the PDF so the document remains visible underneath.
+        if not a.no_whiteboard:
+            transparent_wb = pdf_rendered
+            wb_path = outdir / ("whiteboard_timeline.mov" if transparent_wb else "whiteboard_timeline.mp4")
+            if render_whiteboard_video(Path(a.cap), wb_path, duration, a.fps, transparent=transparent_wb):
+                if pdf_rendered:
+                    video_items.insert(1, (wb_path, 0.0, "whiteboard"))
+                else:
+                    video_items.insert(0, (wb_path, 0.0, "whiteboard"))
 
     ok = make_class_mp4(audio_items, video_items, Path(a.out), duration, a.fps)
     if failed:
@@ -2925,4 +3583,4 @@ def _advanced_main(argv=None):
 if __name__ == "__main__":
     raise SystemExit(_pipeline_main())
 
-#MadMad_2928
+#MadMad_2586
