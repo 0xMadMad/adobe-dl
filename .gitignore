@@ -1,11 +1,10 @@
-# chrome
 chrome_profile/
 chrome_profiles/
-
-# downloaded
-class_work/
-class.mp4
 capture_*/
+*.mp4
+*.flv
+*.seg
+*/قسمت_*/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
