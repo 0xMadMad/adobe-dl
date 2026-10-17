@@ -33,7 +33,7 @@ python adobe_connect_downloader.py
 
 ### مرحله ۱: ضبط
 1. Chrome باز میشه، لاگین کن و کلاس ضبط شده رو باز کن.
-2. چند ثانیه‌ش رو پخش کن. بهتره چند جای کلاس رو هم بری و چند ثانیه پخش کنی (اول، ۲۵٪، ۵۰٪، ۷۵٪، آخر).
+2. چند ثانیه‌ش رو پخش کن. بهتره چند جای کلاس رو هم بری و چند ثانیه پخش کنی (مخصوصا جاهایی که نوع share عوض میشه یا مثلا اول، ۲۵٪، ۵۰٪، ۷۵٪، آخر).
 3. ویدیو رو استپ کن
 4. برگرد تو ترمینال **Enter** بزن.
 
@@ -54,6 +54,8 @@ Full class duration (seconds, M:SS, or H:MM:SS; Enter=use_detected):
 ### مرحله ۲: دانلود و رندر
 خودکار انجام میشه و آخرش ویدیو تو پوشه‌ی همون کلاس ساخته میشه (مثلا `ریاضی_مهندسی\قسمت_02\ریاضی_مهندسی-02.mp4`).
 > اگه وسطش قطع شد یا خروجی ناقص بود یا هر مشکل دیگه ای، همون دستور رو دوباره بزن (باید همون کلاس و همون قسمت باشه). قطعه‌ های کامل دوباره دانلود نمیشن، ضبط (capture) هر بار تازه گرفته میشه و ویدیو دوباره ساخته میشه.
+
+> اگه فقط رندر نهایی رو میخوای دوباره بگیری (بدون لاگین و ضبط دوباره)، از `--tools all` استفاده کن (مثال تو بخش دستورهای پیشرفته). دانلود قطعه‌های جامونده ولی به لاگین مجدد نیاز داره، پس اون رو با اجرای معمولی بزن.
 
 > برای استفاده‌ دوباره از قطعه‌ های دانلود شده حواست باشه `--seg` و `--overlap` رو عوض نکنی و مدت کلاس رو همون قبلی بزنی.
 
@@ -88,7 +90,7 @@ Full class duration (seconds, M:SS, or H:MM:SS; Enter=use_detected):
 |`--outdir`|`<پوشه کلاس>/work`|پوشه کار|
 |`--root`|`./`|پوشه‌ ای که پوشه‌ کلاس‌ ها توش ساخته میشه|
 |`--length`|میپرسه|مدت کلاس (ثانیه)|
-|`--fps`|`10`|فریم‌ریت|
+|`--fps`|`10`|فریم‌ریت (هرچی کمتر رندر سریع تر)|
 |`--chrome`|خودکار|مسیر Chrome|
 |`--port`|`9222`|پورت دیباگ|
 |`--profile`|`chrome_profile`|پروفایل Chrome (لاگین رو نگه میداره)|
@@ -122,11 +124,13 @@ python adobe_connect_downloader.py --tools <دستور> ...
 |`analyze <dir>`|<div dir="rtl">گزارش ضبط (میره تو `analysis.txt`)</div>|
 |`inspect <dir> --ws ws3`|<div dir="rtl">بازرسی فریم‌ها (میره تو `inspect.txt`)</div>|
 
-<div dir="rtl">مثلا مرحله ۲ شکست خورد، بدون ضبط دوباره:</div>
+<div dir="rtl">مثلا مرحله ۲ شکست خورد، یا فقط میخوای رندر رو دوباره بگیری، بدون ضبط دوباره:</div>
 
 ```bash
-python adobe_connect_downloader.py --tools all "ریاضی_مهندسی\قسمت_02\capture" --length 4819 --outdir "ریاضی_مهندسی\قسمت_02\work" --out "ریاضی_مهندسی\قسمت_02\ریاضی_مهندسی-02.mp4" --reuse
+python adobe_connect_downloader.py --tools all "ریاضی_مهندسی\قسمت_02\capture" --length 4819 --outdir "ریاضی_مهندسی\قسمت_02\work" --out "ریاضی_مهندسی\قسمت_02\ریاضی_مهندسی-02.mp4" --reuse --fps 10 --conns 0 --no-files
 ```
+
+(`--length` و بقیه رو همون مقدار اجرای اصلی بذار تا اسم قطعه‌ها یکی بمونه و چیزی دوباره دانلود نشه.)
 
 ---
 
@@ -140,7 +144,7 @@ python adobe_connect_downloader.py --tools all "ریاضی_مهندسی\قسمت
 * `*.flv` استریم‌های ادغام شده
 * `files/` فایل‌ها و PDFها
 * `extras/` رویدادهای چت و ... (فعلا فقط ذخیره میشن ولی تو ویدیو نیستن)
-* `pdf_timeline.mp4` و `whiteboard_timeline.mov|mp4`
+* `content_timeline.mp4` ویدیوی لایه‌ی PDF و وایت‌بورد
 
 **فایل نهایی**: `<اسم کلاس>-<قسمت>.mp4`
 ویدیوی نهایی ۱۲۸۰×۷۲۰ هست.
@@ -160,13 +164,17 @@ python adobe_connect_downloader.py --tools all "ریاضی_مهندسی\قسمت
 |`no Connect response`|<div dir="rtl">ticket منقضی شده</div>|<div dir="rtl">بعد از ضبط سریع دانلود کن، یا دوباره ضبط کن</div>|
 |`got an HTML page (login/expired cookie?)`|<div dir="rtl">کوکی نامعتبر</div>|<div dir="rtl">دوباره ضبط کن و سریع دانلود کن</div>|
 |`PDF ... rendering needs PyMuPDF and Pillow`|<div dir="rtl">نصب نیستن</div>|<div dir="rtl">`pip install pymupdf pillow`</div>|
-|<div dir="rtl">صفحه سفید به جای PDF</div>|<div dir="rtl">PDF رندر نشده، وایت‌بورد سفید همه‌جا رو گرفته</div>|<div dir="rtl">خط `[PDF] ... rendered into video` و پیام‌های `PDF ...`  بالاش رو بخون احتمالا دوباره ران کنی حل میشه</div>|
+|<div dir="rtl"> صفحه‌ با نوشته‌ `file not available` بجای PDF </div>|<div dir="rtl">فایل پیدا نشده</div>|<div dir="rtl">خط‌ های `[PDF]` بالاشو توی ترمینال بخون و موقع ضبط سر اون فایل برو</div>|
 |`no PDF page-change timestamps`|<div dir="rtl">تغییر صفحه تو ضبط نبود</div>|<div dir="rtl">صفحه ۱ ثابت میمونه. موقع ضبط چند جایی که PDF ورق میخوره رو پخش کن</div>|
 |`[DURATION] Player clock not found`|<div dir="rtl">ساعت پلیر موقع Enter تو صفحه نبود</div>|<div dir="rtl">پلیر رو باز نگه دار یا مدت رو دستی بزن</div>|
 |`[INCOMPLETE] ... segment(s)` / `holes`|<div dir="rtl">چندتا قطعه شکست خورد</div>|<div dir="rtl"> همون دستور رو دوباره بزن (همون کلاس و همون قسمت) </div>|
 |`ffmpeg not found`|<div dir="rtl">نصب نیست</div>|<div dir="rtl">نصب کن و ترمینال رو ببند و دوباره باز کن</div>|
 |<div dir="rtl">بعد از `STEP 1/2` گیر میکنه</div>|<div dir="rtl">پروکسی سیستم یا یه Chrome دیگه با همین پروفایل باز مونده</div>|<div dir="rtl">vpnتو خاموش کن دوباره امتحان کن. اوکی نشد همه Chrome ها رو ببند (از task manager) و دوباره بزن.</div>|
 |`[WARN] Could not move capture folder یا پوشه‌ی capture_<زمان> کنار capture`|<div dir="rtl"> پاک‌کردن ضبط قبلی ممکن نشد (فایل قفله یا مسیر خیلی بلنده یا ..) </div>|<div dir="rtl"> پوشه‌ قدیمی capture رو دستی پاک کن </div>
+|`no frames for screenshare_*.flv; nothing written`|<div dir="rtl">سرور برای استریم تصویر چیزی نفرستاده، یا قطعه‌های خالی از اجرای قبل مونده. خروجی: صفحه‌ی سیاه و فقط صدا</div>|<div dir="rtl">اجرای معمولی بزن (نه `--tools all`) تا قطعه‌های خالی دوباره گرفته بشن. اگه باز هم نشد، خط‌های `[END]` رو تو Issue بفرست</div>|
+|`[PDF] ...: NOT AVAILABLE`|<div dir="rtl">شناسه‌ی فایل پیدا نشد، یا فایل نه تو ضبط بود نه قابل دانلود</div>|<div dir="rtl">موقع ضبط سر اون فایل برو و چند ثانیه صبر کن تا PDF لود بشه، بعد دوباره اجرا کن</div>|
+|`GAP` حدود ۲۹۸ ثانیه تو صدا|<div dir="rtl">این سکوت واقعی نیست؛ یه قطعه‌ی ۳۰۰ ثانیه‌ای دانلود نشده</div>|<div dir="rtl">اجرای معمولی بزن (قطعه‌های خالی دوباره گرفته میشن)</div>|
+|`[WARN] events run Ns past the class length`|<div dir="rtl">ضبط بلندتر از زمانیه که ساعت پلیر نشون میداد</div>|<div dir="rtl">مدت کلاس رو دستی کامل بزن(خودش پیشنهاد میده) </div>|
 
 <div dir="rtl">
 
