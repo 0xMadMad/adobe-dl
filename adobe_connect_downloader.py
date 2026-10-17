@@ -2557,6 +2557,16 @@ def report_stream_ends(cap: Path, outdir: Path, audio_t, video_t, duration):
         print(f"[WARN] the last audio ends {duration - audio_end:.0f}s before the class end "
               "(missing audio at the tail, or a stream that was never listed).", flush=True)
 
+def resolve_pdfs_early(a):
+    """Find/fetch the PDFs before the long audio download: the captured cookie can expire during it."""
+    try:
+        cap, outdir = Path(a.cap), Path(a.outdir)
+        state = extract_share_state(cap)
+        if state["timeline"] and state["items"]:
+            resolve_share_pdfs(cap, outdir, state)
+    except Exception as e:
+        print(f"[PDF] early lookup skipped: {type(e).__name__}: {e}", flush=True)
+
 def _item_label(state, k):
     it = state["items"].get(k)
     if it is None:
@@ -2687,9 +2697,12 @@ def resolve_share_pdfs(cap: Path, outdir: Path, state):
         return None, "", None
 
     out, unresolved, claimed = {}, [], set()
-    for it in state["items"].values():
+    shown = {k for _, k in state["timeline"]}
+    for k, it in state["items"].items():
         sco = it.get("sco")
         if it["kind"] != "doc" or not sco or sco in out or any(sco == u[0] for u in unresolved):
+            continue
+        if shown and k not in shown:
             continue
         info = state["docs"].get(sco) or {}
         ids = [i for i in (info.get("playback_id"), info.get("content_id")) if i]
@@ -3026,6 +3039,7 @@ def render_content_timeline(cap: Path, out_path: Path, duration: float, fps: flo
 
 async def cmd_all(a):
     ctx = build_ctx(a)
+    resolve_pdfs_early(a)
     names, starts = collect_streams(ctx["frames"])
     nsmap, stats, _, _, _ = scan_ws(ctx["frames"])
 
@@ -3583,4 +3597,4 @@ def _advanced_main(argv=None):
 if __name__ == "__main__":
     raise SystemExit(_pipeline_main())
 
-#MadMad_2586
+#MadMad_3600
